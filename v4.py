@@ -96,7 +96,7 @@ MODE_CONFIG = {
         "badge":        "regular",
         "fear_label":   "VIX 恐慌指數",
         "fear_display": "VIX",
-        "subtitle":     "數據源：yfinance  ·  盤中 09:30–16:00 ET",
+        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  盤中 09:30–16:00 ET",
         "note":         None,
     },
     "premarket": {
@@ -104,8 +104,8 @@ MODE_CONFIG = {
         "badge":        "premarket",
         "fear_label":   "VIX 恐慌指數（含盤前）",
         "fear_display": "VIX",
-        "subtitle":     "數據源：yfinance prepost=True  ·  盤前 07:30–09:30 ET（倫敦 12:30）·  盤後 16:00–20:00 ET",
-        "note":         "盤前模式使用 yfinance prepost=True 直接獲取 VIX 盤前數據，從美東 07:30（倫敦 12:30）開始可用。Alpaca 僅作備用。",
+        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  盤前 07:30 ET（倫敦 12:30）起  ·  盤後 16:00–20:00 ET",
+        "note":         "盤前模式使用 Yahoo Finance v8 Chart API 獲取 VIX 實時 1 分鐘數據（與 TradingView Yahoo feed 同源），從美東 07:30（倫敦 12:30）開始可用。Alpaca 僅作最後備用。",
     },
 }
 
@@ -144,6 +144,53 @@ def fetch_yfinance(ticker: str, bars: int = 30, prepost: bool = False) -> pd.Dat
         df = df.tail(bars).copy()
         df.index = pd.to_datetime(df.index)
         return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)   # 30s cache for real-time feel
+def fetch_yahoo_chart_api(ticker: str, bars: int = 30) -> pd.DataFrame:
+    """
+    Fetch 1-min OHLCV directly from Yahoo Finance v8 chart API.
+    This endpoint returns real-time data including pre/post-market
+    for indices like ^VIX — same source TradingView Yahoo feed uses.
+    No API key required.
+    """
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+            f"?interval=1m&range=1d&includePrePost=true"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return pd.DataFrame()
+
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return pd.DataFrame()
+
+        res      = result[0]
+        ts       = res.get("timestamp", [])
+        quote    = res["indicators"]["quote"][0]
+        adjclose = res["indicators"].get("adjclose", [{}])[0].get("adjclose", quote.get("close"))
+
+        df = pd.DataFrame({
+            "Open":   quote.get("open",   []),
+            "High":   quote.get("high",   []),
+            "Low":    quote.get("low",    []),
+            "Close":  adjclose if adjclose else quote.get("close", []),
+            "Volume": quote.get("volume", []),
+        }, index=pd.to_datetime(ts, unit="s", utc=True))
+
+        df = df.dropna(subset=["Open", "Close"])
+        df.index = df.index.tz_convert("America/New_York")
+        return df.tail(bars)
     except Exception:
         return pd.DataFrame()
 
@@ -279,26 +326,71 @@ def test_alpaca_connection() -> tuple[bool, str]:
 
 
 def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (tsla_df, fear_df) according to current mode."""
-    if st.session_state.mode == "premarket":
-        # yfinance with prepost=True covers VIX from ~07:30 ET
-        # Alpaca used as fallback for TSLA if yfinance prepost is thin
-        tsla = fetch_yfinance("TSLA", 30, prepost=True)
-        vix  = fetch_yfinance("^VIX",  30, prepost=True)
-        # If VIX is empty, try UVXY via Alpaca as backup
-        if vix.empty and "alpaca" in st.secrets:
-            vix = fetch_alpaca("UVXY", 30)
-        return tsla, vix
-    else:
-        return fetch_yfinance("TSLA", 30), fetch_yfinance("^VIX", 30)
+    """
+    Return (tsla_df, vix_df) according to current mode.
+
+    Both modes now use Yahoo Finance v8 chart API (fetch_yahoo_chart_api)
+    which returns real-time 1-min bars including pre/post-market — same
+    data source as TradingView Yahoo feed.
+
+    Fallback chain:
+      1. Yahoo chart API  (real-time, pre+post)
+      2. yfinance library (slight delay, pre+post)
+      3. Alpaca UVXY      (pre-market mode only, if both above fail)
+    """
+    is_pre = st.session_state.mode == "premarket"
+
+    # ── TSLA ──────────────────────────────────────────
+    tsla = fetch_yahoo_chart_api("TSLA", 30)
+    if tsla.empty:
+        tsla = fetch_yfinance("TSLA", 30, prepost=is_pre)
+
+    # ── VIX ───────────────────────────────────────────
+    vix = fetch_yahoo_chart_api("%5EVIX", 30)   # %5E = ^ URL-encoded
+    if vix.empty:
+        vix = fetch_yfinance("^VIX", 30, prepost=is_pre)
+    # Last resort in pre-market: Alpaca UVXY
+    if vix.empty and is_pre and "alpaca" in st.secrets:
+        vix = fetch_alpaca("UVXY", 30)
+
+    return tsla, vix
 
 # ─────────────────────────────────────────────
 # Analysis
 # ─────────────────────────────────────────────
+def align_timestamps(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Strip timezone info and align two DataFrames to their common timestamps.
+    Rounds each index to the nearest minute to handle minor timestamp offsets.
+    """
+    try:
+        d1 = df1.copy()
+        d2 = df2.copy()
+        # Normalize to UTC-naive, rounded to minute
+        d1.index = pd.to_datetime(d1.index).tz_localize(None).round("1min")
+        d2.index = pd.to_datetime(d2.index).tz_localize(None).round("1min")
+        # Keep only shared timestamps
+        common = d1.index.intersection(d2.index)
+        return d1.loc[common], d2.loc[common]
+    except Exception:
+        return df1, df2
+
+
+def get_vix_lag(tsla_df: pd.DataFrame, vix_df: pd.DataFrame) -> int:
+    """Return how many minutes VIX lags behind TSLA (0 = in sync)."""
+    try:
+        t = pd.to_datetime(tsla_df.index[-1]).tz_localize(None)
+        v = pd.to_datetime(vix_df.index[-1]).tz_localize(None)
+        return max(0, int((t - v).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
 def compute_correlation(df1: pd.DataFrame, df2: pd.DataFrame) -> float | None:
     try:
+        a, b = align_timestamps(df1, df2)
         combined = pd.concat(
-            [df1["Close"].rename("A"), df2["Close"].rename("B")], axis=1
+            [a["Close"].rename("A"), b["Close"].rename("B")], axis=1
         ).dropna()
         if len(combined) < 5:
             return None
@@ -310,9 +402,14 @@ def compute_correlation(df1: pd.DataFrame, df2: pd.DataFrame) -> float | None:
 def detect_divergence(df1: pd.DataFrame, df2: pd.DataFrame,
                       window: int = 5) -> tuple[bool, str]:
     try:
-        t1 = df1["Close"].tail(window)
-        t2 = df2["Close"].tail(window)
+        # Use aligned timestamps for fair comparison
+        a, b = align_timestamps(df1, df2)
+        t1 = a["Close"].tail(window)
+        t2 = b["Close"].tail(window)
         if len(t1) < window or len(t2) < window:
+            lag = get_vix_lag(df1, df2)
+            if lag > 5:
+                return False, f"⏳ VIX 數據落後 {lag} 分鐘，等待同步中…"
             return False, "數據不足"
         d1 = 1 if t1.iloc[-1] > t1.iloc[0] else (-1 if t1.iloc[-1] < t1.iloc[0] else 0)
         d2 = 1 if t2.iloc[-1] > t2.iloc[0] else (-1 if t2.iloc[-1] < t2.iloc[0] else 0)
@@ -329,12 +426,40 @@ def detect_divergence(df1: pd.DataFrame, df2: pd.DataFrame,
 # ─────────────────────────────────────────────
 def make_candle_chart(tsla_df: pd.DataFrame, fear_df: pd.DataFrame,
                       fear_label: str) -> go.Figure:
+    """
+    Align both charts to the same time window so they stay in sync.
+    Uses the intersection of the two timeframes for the X-axis range.
+    """
+    # ── find common time window (latest 15 bars of the SLOWER series) ──
+    def tail15(df):
+        return df.tail(15) if not df.empty else df
+
+    t_df = tail15(tsla_df)
+    f_df = tail15(fear_df)
+
+    # Use the overlapping time range so both charts show same period
+    if not t_df.empty and not f_df.empty:
+        # Convert to UTC-naive for comparison
+        t_idx = t_df.index.tz_localize(None) if t_df.index.tzinfo else t_df.index
+        f_idx = f_df.index.tz_localize(None) if f_df.index.tzinfo else f_df.index
+        x_start = max(t_idx[0],  f_idx[0])
+        x_end   = max(t_idx[-1], f_idx[-1])  # show up to latest of either
+        lag_mins = int((t_idx[-1] - f_idx[-1]).total_seconds() / 60)
+        lag_note = f"  ⚠️ VIX 數據落後 {lag_mins} 分鐘" if lag_mins > 2 else ""
+    else:
+        x_start, x_end, lag_note = None, None, ""
+
+    tsla_title = "TSLA  1-Min K線（最新15根）"
+    fear_title = f"{fear_label}  1-Min K線（最新15根）{lag_note}"
+
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=False,
-        subplot_titles=("TSLA  1-Min K線（最新15根）",
-                        f"{fear_label}  1-Min K線（最新15根）"),
-        vertical_spacing=0.14, row_heights=[0.5, 0.5],
+        rows=2, cols=1,
+        shared_xaxes=False,          # independent axes — different update freq
+        subplot_titles=(tsla_title, fear_title),
+        vertical_spacing=0.14,
+        row_heights=[0.5, 0.5],
     )
+
     def add_candles(df, row, cu, cd, name):
         t = df.tail(15)
         fig.add_trace(go.Candlestick(
@@ -356,7 +481,7 @@ def make_candle_chart(tsla_df: pd.DataFrame, fear_df: pd.DataFrame,
     fig.update_xaxes(showgrid=True, gridcolor="#1e2533", zeroline=False)
     fig.update_yaxes(showgrid=True, gridcolor="#1e2533", zeroline=False)
     for ann in fig["layout"]["annotations"]:
-        ann["font"] = dict(size=13, color="#8899aa")
+        ann["font"] = dict(size=13, color="#8899aa" if "⚠️" not in ann.text else "#f4c542")
     return fig
 
 
@@ -593,10 +718,13 @@ with status_row:
 
     with c2:
         cls = "negative" if fear_chg >= 0 else "positive"
+        lag = get_vix_lag(tsla_df, fear_df)
+        lag_str = f"落後 {lag} 分鐘" if lag > 2 else "即時同步 ✓"
+        lag_cls = "negative" if lag > 5 else ("neutral" if lag > 2 else "positive")
         st.markdown(f"""<div class="metric-card">
             <div class="metric-label">{cfg['fear_display']} 最新價</div>
             <div class="metric-value {cls}">{fear_p:.2f}</div>
-            <div class="metric-delta {cls}">{("+" if fear_chg>=0 else "")}{fear_chg:.2f}</div>
+            <div class="metric-delta {lag_cls}">{lag_str}</div>
         </div>""", unsafe_allow_html=True)
 
     with c3:
