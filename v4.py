@@ -102,10 +102,10 @@ MODE_CONFIG = {
     "premarket": {
         "label":        "🌅 盤前/盤後模式",
         "badge":        "premarket",
-        "fear_label":   "VIX 恐慌指數（含盤前）",
-        "fear_display": "VIX",
-        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  盤前 07:30 ET（倫敦 12:30）起  ·  盤後 16:00–20:00 ET",
-        "note":         "盤前模式使用 Yahoo Finance v8 Chart API 獲取 VIX 實時 1 分鐘數據（與 TradingView Yahoo feed 同源），從美東 07:30（倫敦 12:30）開始可用。Alpaca 僅作最後備用。",
+        "fear_label":   "UVXY（2x VIX ETF，實時）",
+        "fear_display": "UVXY",
+        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  UVXY 替代 VIX（盤前實時）  ·  盤前 04:00–09:30 ET",
+        "note":         "⚡ 盤前模式改用 UVXY（ProShares 2x VIX ETF）替代 VIX，原因：Yahoo Finance 對 VIX 指數強制延遲 15 分鐘，而 UVXY 作為股票享有實時盤前報價。UVXY 與 VIX 高度正相關（r ≈ 0.98），與 TSLA 的負相關分析結果一致。",
     },
 }
 
@@ -371,54 +371,48 @@ def test_alpaca_connection() -> tuple[bool, str]:
 
 def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Return (tsla_df, vix_df) according to current mode.
+    Return (tsla_df, fear_df) according to current mode.
 
-    Both modes now use Yahoo Finance v8 chart API (fetch_yahoo_chart_api)
-    which returns real-time 1-min bars including pre/post-market — same
-    data source as TradingView Yahoo feed.
-
-    Fallback chain:
-      1. Yahoo chart API  (real-time, pre+post)
-      2. yfinance library (slight delay, pre+post)
-      3. Alpaca UVXY      (pre-market mode only, if both above fail)
+    盤中模式：TSLA + VIX（Yahoo Chart API，盤中無延遲）
+    盤前模式：TSLA + UVXY（Yahoo Chart API，股票有實時盤前數據）
+             VIX 盤前強制延遲 15 分鐘（Yahoo 免費數據限制），改用 UVXY 替代
     """
     is_pre = st.session_state.mode == "premarket"
 
-    # ── TSLA ──────────────────────────────────────────
+    # ── TSLA（兩種模式都用 Yahoo Chart API，支援盤前）──
     tsla = fetch_yahoo_chart_api("TSLA", 30)
     if tsla.empty:
         tsla = fetch_yfinance("TSLA", 30, prepost=is_pre)
 
-    # ── VIX ───────────────────────────────────────────
-    vix = fetch_yahoo_chart_api("%5EVIX", 30)
-    if vix.empty:
-        vix = fetch_yahoo_chart_api("^VIX", 30)
-    if vix.empty:
-        vix = fetch_yfinance("^VIX", 30, prepost=is_pre)
+    if is_pre:
+        # ── 盤前模式：優先 UVXY（實時股票）替代延遲的 VIX ──
+        # UVXY = ProShares Ultra VIX Short-Term ETF (2x)，與 VIX 高度正相關
+        fear = fetch_yahoo_chart_api("UVXY", 30)
+        if fear.empty:
+            fear = fetch_yfinance("UVXY", 30, prepost=True)
+        # 若 Alpaca 已設定且 Yahoo 失敗，用 Alpaca 作備用
+        if fear.empty and "alpaca" in st.secrets:
+            fear = fetch_alpaca("UVXY", 30)
+        # 記錄使用 UVXY
+        if not fear.empty:
+            st.session_state["fear_ticker_used"] = "UVXY"
+        else:
+            # 最後才回落到延遲 VIX
+            fear = fetch_yahoo_chart_api("%5EVIX", 30)
+            if fear.empty:
+                fear = fetch_yfinance("^VIX", 30, prepost=True)
+            st.session_state["fear_ticker_used"] = "VIX(延遲)"
+    else:
+        # ── 盤中模式：直接用 VIX（盤中無延遲）──
+        fear = fetch_yahoo_chart_api("%5EVIX", 30)
+        if fear.empty:
+            fear = fetch_yahoo_chart_api("^VIX", 30)
+        if fear.empty:
+            fear = fetch_yfinance("^VIX", 30, prepost=False)
+        if not fear.empty:
+            st.session_state["fear_ticker_used"] = "VIX"
 
-    # 盤前：若 VIX K線落後超過 10 分鐘，先嘗試 UVXY 作為補充參考
-    if is_pre and not vix.empty and not tsla.empty:
-        lag = get_vix_lag(tsla, vix)
-        if lag > 10 and "alpaca" in st.secrets:
-            uvxy = fetch_alpaca("UVXY", 30)
-            if not uvxy.empty:
-                # UVXY 更即時，若比 VIX 新則優先使用
-                uvxy_lag = get_vix_lag(tsla, uvxy)
-                if uvxy_lag < lag:
-                    vix = uvxy
-                    st.session_state["vix_patch_info"] = (
-                        f"🔄 已切換至 UVXY（VIX 落後 {lag}min，UVXY 落後 {uvxy_lag}min）"
-                    )
-
-    # 最後備用
-    if vix.empty and is_pre and "alpaca" in st.secrets:
-        vix = fetch_alpaca("UVXY", 30)
-
-    # 核心：用實時報價補全 VIX 缺失的 K 線
-    if not vix.empty:
-        vix = patch_vix_latest(vix)
-
-    return tsla, vix
+    return tsla, fear
 
 # ─────────────────────────────────────────────
 # Analysis
@@ -776,7 +770,14 @@ api_secret = "XXXXXXXXXXXXXXXXXXXXXXXX"
 
     st.divider()
     st.markdown("### 📡 數據源狀態")
-    for key in ["yahoo_api_TSLA_ok", "yahoo_api_%5EVIX_ok", "yahoo_api_^VIX_ok", "yahoo_api_VIX_ok"]:
+    fear_used = st.session_state.get("fear_ticker_used", "—")
+    fear_color = "#f4c542" if "延遲" in fear_used else "#00d084"
+    st.markdown(
+        f'<div style="font-size:12px;color:#8899aa;padding:2px 0">恐慌指標：' +
+        f'<span style="color:{fear_color};font-weight:600">{fear_used}</span></div>',
+        unsafe_allow_html=True,
+    )
+    for key in ["yahoo_api_TSLA_ok", "yahoo_api_UVXY_ok", "yahoo_api_%5EVIX_ok"]:
         val = st.session_state.get(key)
         if val:
             color = "#00d084" if val.startswith("✅") else "#ff4d6d"
