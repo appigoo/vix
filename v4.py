@@ -102,10 +102,10 @@ MODE_CONFIG = {
     "premarket": {
         "label":        "🌅 盤前/盤後模式",
         "badge":        "premarket",
-        "fear_label":   "UVXY（2x VIX ETF）",
-        "fear_display": "UVXY",
-        "subtitle":     "數據源：Alpaca Markets  ·  盤前 04:00–09:30 ET  ·  盤後 16:00–20:00 ET",
-        "note":         "盤前模式以 UVXY（2倍做多VIX ETF）替代 VIX 指數，原因：VIX 本身無盤前交易數據。UVXY 與 TSLA 同樣高度負相關，可準確反映恐慌情緒。",
+        "fear_label":   "VIX 恐慌指數（含盤前）",
+        "fear_display": "VIX",
+        "subtitle":     "數據源：yfinance prepost=True  ·  盤前 07:30–09:30 ET（倫敦 12:30）·  盤後 16:00–20:00 ET",
+        "note":         "盤前模式使用 yfinance prepost=True 直接獲取 VIX 盤前數據，從美東 07:30（倫敦 12:30）開始可用。Alpaca 僅作備用。",
     },
 }
 
@@ -131,10 +131,12 @@ def send_telegram(message: str) -> bool:
 # ─────────────────────────────────────────────
 
 @st.cache_data(ttl=55)
-def fetch_yfinance(ticker: str, bars: int = 30) -> pd.DataFrame:
+def fetch_yfinance(ticker: str, bars: int = 30, prepost: bool = False) -> pd.DataFrame:
     try:
-        df = yf.download(ticker, period="1d", interval="1m",
-                         progress=False, auto_adjust=True)
+        df = yf.download(
+            ticker, period="1d", interval="1m",
+            prepost=prepost, progress=False, auto_adjust=True,
+        )
         if df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
@@ -148,7 +150,11 @@ def fetch_yfinance(ticker: str, bars: int = 30) -> pd.DataFrame:
 
 @st.cache_data(ttl=55)
 def fetch_alpaca(ticker: str, bars: int = 30) -> pd.DataFrame:
-    """1-minute bars from Alpaca (supports pre/post-market via IEX feed)."""
+    """
+    1-minute bars from Alpaca supporting pre/post-market.
+    Uses start= param to fetch from 4 hours ago so we always
+    catch whatever bars exist even in early pre-market.
+    """
     try:
         key    = st.secrets["alpaca"]["api_key"]
         secret = st.secrets["alpaca"]["api_secret"]
@@ -156,24 +162,41 @@ def fetch_alpaca(ticker: str, bars: int = 30) -> pd.DataFrame:
             "APCA-API-KEY-ID":     key,
             "APCA-API-SECRET-KEY": secret,
         }
+        # Use start= 4 hours ago in RFC3339 to capture early pre-market bars
+        from datetime import timezone, timedelta
+        start_dt = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
         url = (
             f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
             f"?timeframe=1Min&limit={bars}&feed=iex&adjustment=raw"
+            f"&start={start_dt}&sort=desc"
         )
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
-            # Store error for display
-            st.session_state["alpaca_last_error"] = (
-                f"HTTP {r.status_code}：{r.text[:300]}"
-            )
+            st.session_state["alpaca_last_error"] = f"HTTP {r.status_code}：{r.text[:300]}"
             return pd.DataFrame()
-        data = r.json().get("bars", [])
+        data = r.json().get("bars") or []
         if not data:
+            # Try wider window — 8 hours (catches very slow pre-market)
+            start_dt2 = (datetime.now(timezone.utc) - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url2 = (
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
+                f"?timeframe=1Min&limit={bars}&feed=iex&adjustment=raw"
+                f"&start={start_dt2}&sort=desc"
+            )
+            r2 = requests.get(url2, headers=headers, timeout=10)
+            data = (r2.json().get("bars") or []) if r2.status_code == 200 else []
+
+        if not data:
+            now_et = datetime.now(pytz.timezone("America/New_York"))
             st.session_state["alpaca_last_error"] = (
-                f"API 回應正常但 bars 為空 — 當前時段 {ticker} 可能無交易活動"
+                f"bars 為空 [{ticker}]  現在美東 {now_et.strftime('%H:%M')} ET\n"
+                f"IEX 盤前數據從 07:00 ET（倫敦 12:00）開始，請稍後再試"
             )
             return pd.DataFrame()
-        st.session_state["alpaca_last_error"] = None   # clear on success
+
+        st.session_state["alpaca_last_error"] = None
+        # sort=desc means newest first — reverse to chronological
+        data = list(reversed(data))
         df = pd.DataFrame(data).rename(columns={
             "t": "Datetime", "o": "Open", "h": "High",
             "l": "Low",      "c": "Close","v": "Volume",
@@ -258,7 +281,14 @@ def test_alpaca_connection() -> tuple[bool, str]:
 def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (tsla_df, fear_df) according to current mode."""
     if st.session_state.mode == "premarket":
-        return fetch_alpaca("TSLA", 30), fetch_alpaca("UVXY", 30)
+        # yfinance with prepost=True covers VIX from ~07:30 ET
+        # Alpaca used as fallback for TSLA if yfinance prepost is thin
+        tsla = fetch_yfinance("TSLA", 30, prepost=True)
+        vix  = fetch_yfinance("^VIX",  30, prepost=True)
+        # If VIX is empty, try UVXY via Alpaca as backup
+        if vix.empty and "alpaca" in st.secrets:
+            vix = fetch_alpaca("UVXY", 30)
+        return tsla, vix
     else:
         return fetch_yfinance("TSLA", 30), fetch_yfinance("^VIX", 30)
 
@@ -373,7 +403,7 @@ with st.sidebar:
                 st.rerun()
     with col_b:
         pre_type = "primary" if st.session_state.mode == "premarket" else "secondary"
-        if st.button("🌅 盤前後\nAlpaca", use_container_width=True, type=pre_type):
+        if st.button("🌅 盤前後\nyfinance", use_container_width=True, type=pre_type):
             if st.session_state.mode != "premarket":
                 st.session_state.mode          = "premarket"
                 st.session_state.corr_history  = []
