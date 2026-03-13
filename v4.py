@@ -155,10 +155,14 @@ def fetch_yahoo_chart_api(ticker: str, bars: int = 30) -> pd.DataFrame:
     Tries both v8 and v8/finance/chart endpoints with cookie-based auth.
     No API key required.
     """
-    # Try multiple Yahoo endpoints
+    # Use period2=now so Yahoo always returns up to the current minute
+    import time as _time
+    now_ts  = int(_time.time())
+    # period1 = 6 hours ago, period2 = now (forces latest data, not cached range)
+    period1 = now_ts - 6 * 3600
     urls = [
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&period1={period1}&period2={now_ts}&includePrePost=true",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&period1={period1}&period2={now_ts}&includePrePost=true",
     ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -443,13 +447,25 @@ def fetch_yahoo_realtime_quote(ticker: str) -> dict:
         if not result:
             return {}
         q = result[0]
-        price = q.get("regularMarketPrice") or q.get("preMarketPrice") or q.get("postMarketPrice")
-        ts    = q.get("regularMarketTime") or q.get("preMarketTime") or q.get("postMarketTime")
-        chg   = q.get("regularMarketChange", 0)
-        pct   = q.get("regularMarketChangePercent", 0)
+        # Pick most recent price: preMarket > regularMarket > postMarket
+        # depending on time of day
+        market_state = q.get("marketState", "REGULAR")
+        if market_state == "PRE":
+            price = q.get("preMarketPrice") or q.get("regularMarketPrice")
+            ts    = q.get("preMarketTime")  or q.get("regularMarketTime")
+        elif market_state in ("POST", "POSTPOST"):
+            price = q.get("postMarketPrice") or q.get("regularMarketPrice")
+            ts    = q.get("postMarketTime")  or q.get("regularMarketTime")
+        else:
+            price = q.get("regularMarketPrice")
+            ts    = q.get("regularMarketTime")
+
+        chg = q.get("regularMarketChange", 0)
+        pct = q.get("regularMarketChangePercent", 0)
         if price and ts:
             dt = pd.Timestamp(ts, unit="s", tz="UTC").tz_convert("America/New_York")
-            return {"price": price, "time": dt, "change": chg, "changePct": pct}
+            return {"price": float(price), "time": dt, "change": chg,
+                    "changePct": pct, "marketState": market_state}
         return {}
     except Exception:
         return {}
