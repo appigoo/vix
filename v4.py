@@ -162,10 +162,18 @@ def fetch_alpaca(ticker: str, bars: int = 30) -> pd.DataFrame:
         )
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
+            # Store error for display
+            st.session_state["alpaca_last_error"] = (
+                f"HTTP {r.status_code}：{r.text[:300]}"
+            )
             return pd.DataFrame()
         data = r.json().get("bars", [])
         if not data:
+            st.session_state["alpaca_last_error"] = (
+                f"API 回應正常但 bars 為空 — 當前時段 {ticker} 可能無交易活動"
+            )
             return pd.DataFrame()
+        st.session_state["alpaca_last_error"] = None   # clear on success
         df = pd.DataFrame(data).rename(columns={
             "t": "Datetime", "o": "Open", "h": "High",
             "l": "Low",      "c": "Close","v": "Volume",
@@ -173,8 +181,57 @@ def fetch_alpaca(ticker: str, bars: int = 30) -> pd.DataFrame:
         df["Datetime"] = pd.to_datetime(df["Datetime"])
         df = df.set_index("Datetime")
         return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception:
+    except Exception as e:
+        st.session_state["alpaca_last_error"] = f"例外錯誤：{type(e).__name__}: {e}"
         return pd.DataFrame()
+
+
+def test_alpaca_connection() -> tuple[bool, str]:
+    """Diagnostic call — returns (success, message)."""
+    try:
+        key    = st.secrets["alpaca"]["api_key"]
+        secret = st.secrets["alpaca"]["api_secret"]
+    except Exception:
+        return False, "❌ secrets.toml 中找不到 [alpaca] 設定"
+    try:
+        headers = {
+            "APCA-API-KEY-ID":     key,
+            "APCA-API-SECRET-KEY": secret,
+        }
+        # 1) Auth check via account endpoint
+        acct = requests.get(
+            "https://paper-api.alpaca.markets/v2/account",
+            headers=headers, timeout=10,
+        )
+        # 2) Data check
+        data_r = requests.get(
+            "https://data.alpaca.markets/v2/stocks/TSLA/bars"
+            "?timeframe=1Min&limit=3&feed=iex&adjustment=raw",
+            headers=headers, timeout=10,
+        )
+        lines = []
+        lines.append(f"🔑 Auth 端點：HTTP {acct.status_code}")
+        if acct.status_code == 200:
+            info = acct.json()
+            lines.append(f"   帳戶狀態：{info.get('status','?')}  "
+                         f"類型：{info.get('account_type','?')}")
+        else:
+            lines.append(f"   錯誤：{acct.text[:200]}")
+
+        lines.append(f"📊 Data 端點：HTTP {data_r.status_code}")
+        if data_r.status_code == 200:
+            bars = data_r.json().get("bars", [])
+            lines.append(f"   取得 TSLA bars：{len(bars)} 根")
+            if bars:
+                lines.append(f"   最新一根時間：{bars[-1].get('t','?')}")
+                lines.append(f"   收盤價：{bars[-1].get('c','?')}")
+        else:
+            lines.append(f"   錯誤：{data_r.text[:200]}")
+
+        success = data_r.status_code == 200
+        return success, "\n".join(lines)
+    except Exception as e:
+        return False, f"❌ 網絡錯誤：{type(e).__name__}: {e}"
 
 
 def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -347,6 +404,26 @@ api_key    = "PKXXXXXXXXXXXXXXXX"
 api_secret = "XXXXXXXXXXXXXXXXXXXXXXXX"
 """, language="toml")
             st.caption("免費註冊 → alpaca.markets")
+        else:
+            # Show last fetch error if any
+            last_err = st.session_state.get("alpaca_last_error")
+            if last_err:
+                st.markdown(
+                    f'<div style="background:#1f0a0a;border-left:3px solid #ff4d6d;'
+                    f'border-radius:6px;padding:8px 10px;margin:6px 0;'
+                    f'font-size:11px;color:#ffb3b3;word-break:break-all;">'
+                    f'⚠️ 錯誤詳情：<br>{last_err}</div>',
+                    unsafe_allow_html=True,
+                )
+            # Diagnostic test button
+            if st.button("🔍 測試 Alpaca 連線"):
+                with st.spinner("診斷中…"):
+                    ok, msg = test_alpaca_connection()
+                if ok:
+                    st.success("✅ 連線成功！數據正常")
+                else:
+                    st.error("❌ 連線失敗")
+                st.code(msg, language="text")
 
     st.divider()
     if st.button("🗑️ 清除歷史"):
