@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# CSS (保持原樣)
+# CSS
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -82,15 +82,15 @@ defaults = {
     "auto_refresh":       True,
     "alert_cooldown_min": 5,
     "diverge_window":     5,
-    "vix_patch_info":     None,          # 新增：顯示補齊資訊
-    "vix_latest_quote":   None,          # 新增：儲存最新 quote 資訊
+    "vix_patch_info":     None,
+    "vix_latest_quote":   None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ─────────────────────────────────────────────
-# Mode config (保持原樣)
+# Mode config
 # ─────────────────────────────────────────────
 MODE_CONFIG = {
     "regular": {
@@ -106,13 +106,13 @@ MODE_CONFIG = {
         "badge":        "premarket",
         "fear_label":   "VIX 恐慌指數（含盤前）",
         "fear_display": "VIX",
-        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  盤前 07:30 ET（倫敦 12:30）起  ·  盤後 16:00–20:00 ET",
-        "note":         "盤前模式使用 Yahoo Finance v8 Chart API 獲取 VIX 實時 1 分鐘數據（與 TradingView Yahoo feed 同源），從美東 07:30（倫敦 12:30）開始可用。Alpaca 僅作最後備用。",
+        "subtitle":     "數據源：Yahoo Finance 實時 API  ·  盤前 07:30 ET起  ·  盤後 16:00–20:00 ET",
+        "note":         "盤前模式使用 Yahoo v8 Chart API，從美東 07:30 開始較穩定。Alpaca 為備援。",
     },
 }
 
 # ─────────────────────────────────────────────
-# Telegram (保持原樣)
+# Telegram
 # ─────────────────────────────────────────────
 def send_telegram(message: str) -> bool:
     try:
@@ -129,10 +129,10 @@ def send_telegram(message: str) -> bool:
         return False
 
 # ─────────────────────────────────────────────
-# Data fetching
+# Data fetching functions
 # ─────────────────────────────────────────────
 
-@st.cache_data(ttl=45)  # 稍微縮短 ttl
+@st.cache_data(ttl=45)
 def fetch_yfinance(ticker: str, bars: int = 30, prepost: bool = False) -> pd.DataFrame:
     try:
         df = yf.download(
@@ -149,44 +149,36 @@ def fetch_yfinance(ticker: str, bars: int = 30, prepost: bool = False) -> pd.Dat
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=25)   # 縮短到 25s，讓感覺更即時
+@st.cache_data(ttl=25)
 def fetch_yahoo_chart_api(ticker: str, bars: int = 30) -> pd.DataFrame:
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
         f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
     ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://finance.yahoo.com/",
     }
 
-    last_err = ""
     for url in urls:
         try:
             session = requests.Session()
             session.headers.update(headers)
             session.get("https://finance.yahoo.com", timeout=5)
             r = session.get(url, timeout=10)
-
             if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
                 continue
-
             data = r.json()
-            result = data.get("chart", {}).get("result") or []
+            result = data.get("chart", {}).get("result", [])
             if not result:
                 continue
-
             res = result[0]
             ts = res.get("timestamp", [])
             if not ts:
                 continue
-
             quote = res["indicators"]["quote"][0]
             adjclose = (res["indicators"].get("adjclose") or [{}])[0].get("adjclose", [])
-
             df = pd.DataFrame({
                 "Open":   quote.get("open",   [None]*len(ts)),
                 "High":   quote.get("high",   [None]*len(ts)),
@@ -194,53 +186,22 @@ def fetch_yahoo_chart_api(ticker: str, bars: int = 30) -> pd.DataFrame:
                 "Close":  adjclose if adjclose else quote.get("close", [None]*len(ts)),
                 "Volume": quote.get("volume", [0]*len(ts)),
             }, index=pd.to_datetime(ts, unit="s", utc=True))
-
             df = df.dropna(subset=["Close"])
             if df.empty:
                 continue
-
             df.index = df.index.tz_convert("America/New_York")
+            st.session_state[f"yahoo_api_{ticker}_ok"] = f"✅ {ticker}: {len(df)} bars"
             return df.tail(bars)
-
         except Exception as e:
-            last_err = str(e)
-            continue
-
-    st.session_state[f"yahoo_api_{ticker}_ok"] = f"❌ {ticker}: {last_err}"
+            pass
+    st.session_state[f"yahoo_api_{ticker}_ok"] = f"❌ {ticker} 失敗"
     return pd.DataFrame()
 
-# Alpaca 部分保持原樣（略過貼出以節省空間，若需要可保留原版）
-
-def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
-    is_pre = st.session_state.mode == "premarket"
-
-    # TSLA
-    tsla = fetch_yahoo_chart_api("TSLA", 30)
-    if tsla.empty:
-        tsla = fetch_yfinance("TSLA", 30, prepost=is_pre)
-
-    # VIX
-    vix = fetch_yahoo_chart_api("%5EVIX", 30)
-    if vix.empty:
-        vix = fetch_yahoo_chart_api("^VIX", 30)
-    if vix.empty:
-        vix = fetch_yfinance("^VIX", 30, prepost=is_pre)
-
-    # 強制 patch VIX（核心改進）
-    if not vix.empty or tsla.empty:  # 即使 vix 空也嘗試 patch 出最新
-        vix = patch_vix_latest(vix)
-
-    return tsla, vix
-
-# ─────────────────────────────────────────────
-# 加強版 patch_vix_latest：強制補到「現在」
-# ─────────────────────────────────────────────
 def fetch_yahoo_realtime_quote(ticker: str) -> dict:
-    # 移除 cache 或設 ttl=10，讓 quote 更即時
     try:
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
         headers = {
-            "User-Agent": "Mozilla/5.0 ...",  # 同上
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://finance.yahoo.com/",
         }
         r = requests.get(url, headers=headers, timeout=8)
@@ -250,32 +211,22 @@ def fetch_yahoo_realtime_quote(ticker: str) -> dict:
         if not result:
             return {}
         q = result[0]
-
-        # 優先取 preMarket / postMarket / regular
         price = None
         ts = None
         source = "regular"
         if q.get("preMarketPrice") and q.get("preMarketTime"):
-            price = q["preMarketPrice"]
-            ts = q["preMarketTime"]
-            source = "pre"
+            price, ts, source = q["preMarketPrice"], q["preMarketTime"], "pre"
         elif q.get("postMarketPrice") and q.get("postMarketTime"):
-            price = q["postMarketPrice"]
-            ts = q["postMarketTime"]
-            source = "post"
+            price, ts, source = q["postMarketPrice"], q["postMarketTime"], "post"
         elif q.get("regularMarketPrice") and q.get("regularMarketTime"):
-            price = q["regularMarketPrice"]
-            ts = q["regularMarketTime"]
-            source = "regular"
-
+            price, ts = q["regularMarketPrice"], q["regularMarketTime"]
         if price and ts:
             dt = pd.Timestamp(ts, unit="s", tz="UTC").tz_convert("America/New_York")
             return {
                 "price": price,
                 "time": dt,
-                "change": q.get("regularMarketChange", 0),
+                "source": source,
                 "changePct": q.get("regularMarketChangePercent", 0),
-                "source": source
             }
         return {}
     except:
@@ -287,102 +238,213 @@ def patch_vix_latest(vix_df: pd.DataFrame) -> pd.DataFrame:
         st.session_state["vix_patch_info"] = "無法取得 VIX 即時報價"
         return vix_df
 
-    now_et = datetime.now(pytz.timezone("America/New_York")).floor("T")  # floor to minute
+    now_et = datetime.now(pytz.timezone("America/New_York")).floor("T")
     qt = quote["time"].floor("T")
 
-    # 取最後一根 bar 的時間（若空則假設從 30 分前開始）
     if vix_df.empty:
         last_t = now_et - timedelta(minutes=30)
     else:
         last_t = vix_df.index[-1].floor("T")
 
-    minutes_to_patch = int((qt - last_t).total_seconds() / 60)
+    minutes_gap = int((qt - last_t).total_seconds() / 60)
 
-    if minutes_to_patch <= 1:
-        # 已夠新，僅更新最後一根 close
-        vix_df.iloc[-1, vix_df.columns.get_loc("Close")] = quote["price"]
+    if minutes_gap <= 1:
+        if not vix_df.empty:
+            vix_df.iloc[-1, vix_df.columns.get_loc("Close")] = quote["price"]
         st.session_state["vix_latest_quote"] = quote
         return vix_df
 
-    # 強制補齊到 quote 時間
+    # 補齊
     price = quote["price"]
     new_rows = []
     t = last_t + timedelta(minutes=1)
     while t <= qt:
-        new_rows.append({
-            "Open": price, "High": price,
-            "Low": price, "Close": price,
-            "Volume": 0
-        })
+        new_rows.append({"Open": price, "High": price, "Low": price, "Close": price, "Volume": 0})
         t += timedelta(minutes=1)
 
     if new_rows:
-        new_df = pd.DataFrame(new_rows, index=pd.date_range(start=last_t + timedelta(minutes=1), periods=len(new_rows), freq="T", tz="America/New_York"))
+        new_index = pd.date_range(start=last_t + timedelta(minutes=1), periods=len(new_rows), freq="T", tz="America/New_York")
+        new_df = pd.DataFrame(new_rows, index=new_index)
         vix_df = pd.concat([vix_df, new_df])
 
-    # 最後再更新最新 quote 資訊
-    st.session_state["vix_patch_info"] = f"已補齊 {len(new_rows)} 分鐘至 {qt.strftime('%H:%M')}"
+    st.session_state["vix_patch_info"] = f"補齊 {len(new_rows)} 分鐘至 {qt.strftime('%H:%M')}"
     st.session_state["vix_latest_quote"] = quote
-
     return vix_df
 
-# 其他函數（align_timestamps, compute_correlation, detect_divergence 等）保持原樣，略過重貼
+def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
+    is_pre = st.session_state.mode == "premarket"
+    tsla = fetch_yahoo_chart_api("TSLA", 30)
+    if tsla.empty:
+        tsla = fetch_yfinance("TSLA", 30, prepost=is_pre)
+
+    vix = fetch_yahoo_chart_api("%5EVIX", 30)
+    if vix.empty:
+        vix = fetch_yahoo_chart_api("^VIX", 30)
+    if vix.empty:
+        vix = fetch_yfinance("^VIX", 30, prepost=is_pre)
+
+    vix = patch_vix_latest(vix)
+    return tsla, vix
 
 # ─────────────────────────────────────────────
-# 主程式邏輯（部分修改）
+# Analysis functions (簡化版，保留核心)
 # ─────────────────────────────────────────────
-# ... (sidebar, header 等保持原樣)
+
+def get_vix_lag(tsla_df, vix_df):
+    if tsla_df.empty or vix_df.empty:
+        return 999
+    t = pd.to_datetime(tsla_df.index[-1]).tz_localize(None).floor("T")
+    v = pd.to_datetime(vix_df.index[-1]).tz_localize(None).floor("T")
+    return max(0, int((t - v).total_seconds() / 60))
+
+def compute_correlation(df1, df2):
+    if df1.empty or df2.empty:
+        return None
+    common = df1.index.intersection(df2.index)
+    if len(common) < 5:
+        return None
+    a = df1.loc[common, "Close"]
+    b = df2.loc[common, "Close"]
+    return a.corr(b)
+
+def detect_divergence(df1, df2, window=5):
+    if df1.empty or df2.empty:
+        return False, "數據不足"
+    a = df1["Close"].tail(window)
+    b = df2["Close"].tail(window)
+    if len(a) < window:
+        return False, "數據不足"
+    d1 = 1 if a.iloc[-1] > a.iloc[0] else (-1 if a.iloc[-1] < a.iloc[0] else 0)
+    d2 = 1 if b.iloc[-1] > b.iloc[0] else (-1 if b.iloc[-1] < b.iloc[0] else 0)
+    if d1 == 0 or d2 == 0:
+        return False, "價格持平"
+    if d1 == d2:
+        return True, f"⚠️ 同步{'上漲' if d1==1 else '下跌'}（過去{window}分鐘）"
+    return False, f"負相關正常：{'TSLA↑ VIX↓' if d1==1 else 'TSLA↓ VIX↑'}"
+
+def price_delta(df):
+    if df.empty or len(df) < 2:
+        return 0.0, 0.0
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    return last, last - prev
+
+# ─────────────────────────────────────────────
+# Charts (簡化版)
+# ─────────────────────────────────────────────
+
+def make_candle_chart(tsla_df, vix_df, fear_label):
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=False, vertical_spacing=0.15,
+                        subplot_titles=("TSLA 1分K", f"{fear_label} 1分K"))
+    if not tsla_df.empty:
+        t = tsla_df.tail(15)
+        fig.add_trace(go.Candlestick(x=t.index, open=t.Open, high=t.High, low=t.Low, close=t.Close,
+                                     name="TSLA", increasing_line_color="#00d084", decreasing_line_color="#ff4d6d"),
+                      row=1, col=1)
+    if not vix_df.empty:
+        v = vix_df.tail(15)
+        fig.add_trace(go.Candlestick(x=v.index, open=v.Open, high=v.High, low=v.Low, close=v.Close,
+                                     name=fear_label, increasing_line_color="#f4c542", decreasing_line_color="#ff6e40"),
+                      row=2, col=1)
+    fig.update_layout(template="plotly_dark", height=580, showlegend=False,
+                      margin=dict(l=10,r=10,t=50,b=10))
+    return fig
+
+# ─────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ 控制")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("盤中模式", type="primary" if st.session_state.mode == "regular" else "secondary"):
+            st.session_state.mode = "regular"
+            st.rerun()
+    with col2:
+        if st.button("盤前/後", type="primary" if st.session_state.mode == "premarket" else "secondary"):
+            st.session_state.mode = "premarket"
+            st.rerun()
+
+    cfg = MODE_CONFIG[st.session_state.mode]
+    st.markdown(f'<div class="mode-badge-{cfg["badge"]}">{cfg["label"]}</div>', unsafe_allow_html=True)
+
+    st.session_state.auto_refresh = st.toggle("自動更新（60秒）", st.session_state.auto_refresh)
+    manual_refresh = st.button("立即刷新")
+
+# ─────────────────────────────────────────────
+# Header
+# ─────────────────────────────────────────────
+cfg = MODE_CONFIG[st.session_state.mode]
+st.markdown(f"<h2 style='text-align:center'>TSLA × {cfg['fear_display']} 負相關監控</h2>", unsafe_allow_html=True)
+st.caption(cfg["subtitle"])
+
+# ─────────────────────────────────────────────
+# Refresh logic
+# ─────────────────────────────────────────────
+now_et = datetime.now(pytz.timezone("America/New_York"))
+
+should_refresh = (
+    manual_refresh or
+    st.session_state.last_refresh is None or
+    (st.session_state.auto_refresh and
+     (datetime.now() - st.session_state.last_refresh).total_seconds() >= 60)
+)
+
+status_row = st.container()
+chart_col1, chart_col2 = st.columns([3, 2])
+corr_section = st.container()
 
 if should_refresh:
-    with st.spinner("正在拉取最新市場數據…"):
+    with st.spinner("更新中..."):
         tsla_df, fear_df = fetch_pair()
     st.session_state.last_refresh = datetime.now()
+else:
+    # 避免第一次載入空白，使用最後一次資料或空
+    if "tsla_df" not in globals() or "fear_df" not in globals():
+        tsla_df, fear_df = fetch_pair()
+    else:
+        # 使用快取或先前資料
+        pass
 
-    # ... (計算 corr, 偵測偏離, 發送警報 等保持原樣)
+corr = compute_correlation(tsla_df, fear_df)
+diverged, div_desc = detect_divergence(tsla_df, fear_df, st.session_state.diverge_window)
 
 # ─────────────────────────────────────────────
-# Metric cards – 新增 VIX quote 時間顯示
+# Metric cards
 # ─────────────────────────────────────────────
 with status_row:
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     tsla_p, tsla_chg = price_delta(tsla_df)
     fear_p, fear_chg = price_delta(fear_df)
-    corr_str = f"{corr:.3f}" if corr is not None else "—"
-    corr_cls = "negative" if corr and corr > -0.3 else "positive"
 
-    # TSLA card (原樣)
     with c1:
         cls = "positive" if tsla_chg >= 0 else "negative"
-        st.markdown(f"""<div class="metric-card">...""", unsafe_allow_html=True)  # 原內容
+        st.metric("TSLA", f"${tsla_p:.2f}", f"{tsla_chg:+.2f}")
 
-    # VIX card – 加強顯示 quote 時間與 patch 狀態
     with c2:
         lag = get_vix_lag(tsla_df, fear_df)
-        lag_str = f"落後 {lag} 分鐘" if lag > 2 else "同步 ✓"
-        lag_cls = "negative" if lag > 5 else ("neutral" if lag > 2 else "positive")
+        lag_text = f"落後 {lag} min" if lag > 2 else "同步"
+        st.metric("VIX", f"{fear_p:.2f}", lag_text)
 
-        quote_time_str = "—"
-        if st.session_state.vix_latest_quote:
-            qt = st.session_state.vix_latest_quote["time"]
-            source = st.session_state.vix_latest_quote.get("source", "?")
-            quote_time_str = f"{qt.strftime('%H:%M')} ({source})"
+    with c3:
+        corr_str = f"{corr:.3f}" if corr is not None else "—"
+        st.metric("相關係數", corr_str)
 
-        patch_str = st.session_state.get("vix_patch_info", "")
+    with c4:
+        status = "⚠️ 偏離" if diverged else "正常"
+        st.metric("狀態", status)
 
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">{cfg['fear_display']} 最新價</div>
-            <div class="metric-value {cls}">{fear_p:.2f}</div>
-            <div class="metric-delta {lag_cls}">{lag_str}</div>
-            <div style="font-size:11px; color:#8899aa; margin-top:4px;">
-                Quote 時間：{quote_time_str}<br>{patch_str}
-            </div>
-        </div>""", unsafe_allow_html=True)
+# Charts
+with chart_col1:
+    st.plotly_chart(make_candle_chart(tsla_df, fear_df, cfg["fear_display"]), use_container_width=True)
 
-    # 其他 card (相關係數、狀態、模式) 保持原樣
+with chart_col2:
+    if diverged:
+        st.markdown(f'<div class="alert-box">{div_desc}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="ok-box">{div_desc}</div>', unsafe_allow_html=True)
 
-# ... 其餘圖表、歷史相關係數等部分保持原樣
-
-# Auto-refresh
+# Auto refresh
 if st.session_state.auto_refresh:
     time.sleep(60)
     st.rerun()
