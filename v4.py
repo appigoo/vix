@@ -398,11 +398,99 @@ def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
     if vix.empty and is_pre and "alpaca" in st.secrets:
         vix = fetch_alpaca("UVXY", 30)
 
+    # Patch VIX with real-time quote to fill any lag gap
+    if not vix.empty:
+        vix = patch_vix_latest(vix)
+
     return tsla, vix
 
 # ─────────────────────────────────────────────
 # Analysis
 # ─────────────────────────────────────────────
+def fetch_yahoo_realtime_quote(ticker: str) -> dict:
+    """
+    Fetch real-time quote (bid/ask/last price) from Yahoo Finance v7 quote API.
+    Returns dict with keys: price, time (datetime), change, changePct
+    This updates every ~15s and reflects true real-time price.
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/122.0.0.0 Safari/537.36",
+            "Referer": "https://finance.yahoo.com/",
+        }
+        session = requests.Session()
+        session.headers.update(headers)
+        session.get("https://finance.yahoo.com", timeout=5)
+        r = session.get(url, timeout=10)
+        if r.status_code != 200:
+            return {}
+        result = r.json().get("quoteResponse", {}).get("result", [])
+        if not result:
+            return {}
+        q = result[0]
+        price = q.get("regularMarketPrice") or q.get("preMarketPrice") or q.get("postMarketPrice")
+        ts    = q.get("regularMarketTime") or q.get("preMarketTime") or q.get("postMarketTime")
+        chg   = q.get("regularMarketChange", 0)
+        pct   = q.get("regularMarketChangePercent", 0)
+        if price and ts:
+            dt = pd.Timestamp(ts, unit="s", tz="UTC").tz_convert("America/New_York")
+            return {"price": price, "time": dt, "change": chg, "changePct": pct}
+        return {}
+    except Exception:
+        return {}
+
+
+def patch_vix_latest(vix_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If VIX bars are stale (>5 min behind), fetch real-time quote and
+    append a synthetic 1-min bar for the current minute so the chart
+    always shows the latest price.
+    """
+    if vix_df.empty:
+        return vix_df
+    try:
+        quote = fetch_yahoo_realtime_quote("%5EVIX")
+        if not quote:
+            return vix_df
+        qt = quote["time"].floor("1min")  # round to minute
+        last_bar_t = vix_df.index[-1]
+        if hasattr(last_bar_t, 'tzinfo') and last_bar_t.tzinfo is None:
+            last_bar_t = last_bar_t.tz_localize("America/New_York")
+        last_bar_t = pd.Timestamp(last_bar_t).tz_convert("America/New_York").floor("1min")
+
+        lag_mins = (qt - last_bar_t).total_seconds() / 60
+        if lag_mins <= 1:
+            return vix_df  # already fresh
+
+        # Build synthetic bar(s) to fill the gap
+        price = quote["price"]
+        new_rows = []
+        t = last_bar_t + pd.Timedelta(minutes=1)
+        while t <= qt:
+            new_rows.append({
+                "Open": price, "High": price,
+                "Low":  price, "Close": price, "Volume": 0,
+                "Datetime": t,
+            })
+            t += pd.Timedelta(minutes=1)
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows).set_index("Datetime")
+            new_df.index = new_df.index.tz_localize("America/New_York")                 if new_df.index.tzinfo is None else new_df.index
+            # Align tz with vix_df
+            if vix_df.index.tzinfo is None:
+                vix_df.index = vix_df.index.tz_localize("America/New_York")
+            vix_df = pd.concat([vix_df, new_df])
+            # Update last bar close = real-time price for accuracy
+            vix_df.iloc[-1, vix_df.columns.get_loc("Close")] = price
+        return vix_df
+    except Exception:
+        return vix_df
+
+
 def align_timestamps(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Strip timezone info and align two DataFrames to their common timestamps.
@@ -656,6 +744,12 @@ api_secret = "XXXXXXXXXXXXXXXXXXXXXXXX"
                 f'<div style="font-size:11px;color:{color};padding:2px 0">{val}</div>',
                 unsafe_allow_html=True,
             )
+    vix_patch = st.session_state.get("vix_patch_info")
+    if vix_patch:
+        st.markdown(
+            f'<div style="font-size:11px;color:#f4c542;padding:2px 0">{vix_patch}</div>',
+            unsafe_allow_html=True,
+        )
 
     st.divider()
     if st.button("🗑️ 清除歷史"):
