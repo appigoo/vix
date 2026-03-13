@@ -28,6 +28,7 @@ st.markdown("""
   }
   .metric-label { color: #8b8fa8; font-size: 0.78rem; letter-spacing: 0.05em; }
   .metric-value { font-size: 1.6rem; font-weight: 700; margin-top: 4px; }
+  .metric-sub   { font-size: 0.85rem; font-weight: 600; margin-top: 2px; }
   .status-ok   { color: #00d97e; }
   .status-warn { color: #f6c90e; }
   .status-bad  { color: #e84045; }
@@ -202,31 +203,59 @@ if data_ok:
 tsla_price = float(tsla_df["Close"].iloc[-1]) if data_ok else None
 uvxy_price = float(uvxy_df["Close"].iloc[-1]) if data_ok else None
 
-if corr_value is not None and corr_value < -0.7:
-    corr_color, corr_class = "#00d97e", "status-ok"
-    status_text, status_class = "✅ 負相關正常", "status-ok"
-elif corr_value is not None and corr_value < -0.5:
-    corr_color, corr_class = "#f6c90e", "status-warn"
-    status_text, status_class = "⚠️ 相關性偏弱", "status-warn"
-else:
-    corr_color, corr_class = "#e84045", "status-bad"
-    status_text, status_class = "🚨 負相關失效", "status-bad"
+# Compute % change from first candle in display window
+def pct_change(df, bars):
+    tail = df["Close"].tail(bars)
+    if len(tail) < 2:
+        return None
+    return (tail.iloc[-1] - tail.iloc[0]) / tail.iloc[0] * 100
 
-c1, c2, c3, c4, c5 = st.columns(5)
-cards = [
-    (c1, "TSLA 最新價", f"${tsla_price:.2f}" if tsla_price else "—", "#5c7cfa"),
-    (c2, "UVXY 最新價", f"${uvxy_price:.2f}" if uvxy_price else "—", "#f6c90e"),
-    (c3, "皮爾森相關係數", f"{corr_value:.3f}" if corr_value is not None else "—", corr_color),
-    (c4, "相關性狀態", status_text if corr_value is not None else "計算中", "#e84045" if direction_diverge else "#00d97e"),
-    (c5, "最後更新", datetime.now().strftime("%H:%M:%S"), "#8b8fa8"),
-]
-for col, label, value, color in cards:
+tsla_pct = pct_change(tsla_df, display_bars) if data_ok else None
+uvxy_pct = pct_change(uvxy_df, display_bars) if data_ok else None
+
+def fmt_pct(v):
+    if v is None:
+        return "—"
+    arrow = "▲" if v >= 0 else "▼"
+    return f"{arrow} {abs(v):.2f}%"
+
+def pct_color(v):
+    if v is None:
+        return "#8b8fa8"
+    return "#00d97e" if v >= 0 else "#e84045"
+
+if corr_value is not None and corr_value < -0.7:
+    corr_color = "#00d97e"
+    status_text = "✅ 負相關正常"
+elif corr_value is not None and corr_value < -0.5:
+    corr_color = "#f6c90e"
+    status_text = "⚠️ 相關性偏弱"
+else:
+    corr_color = "#e84045"
+    status_text = "🚨 負相關失效"
+
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+
+def metric_card(col, label, value, color, sub=None, sub_color="#8b8fa8"):
+    sub_html = f'<div class="metric-sub" style="color:{sub_color}">{sub}</div>' if sub else ""
     with col:
         st.markdown(f"""
         <div class="metric-card">
           <div class="metric-label">{label}</div>
           <div class="metric-value" style="color:{color}">{value}</div>
+          {sub_html}
         </div>""", unsafe_allow_html=True)
+
+metric_card(c1, "TSLA 最新價",   f"${tsla_price:.2f}" if tsla_price else "—", "#5c7cfa",
+            sub=fmt_pct(tsla_pct), sub_color=pct_color(tsla_pct))
+metric_card(c2, "TSLA 漲跌幅",   fmt_pct(tsla_pct), pct_color(tsla_pct))
+metric_card(c3, "UVXY 最新價",   f"${uvxy_price:.2f}" if uvxy_price else "—", "#f6c90e",
+            sub=fmt_pct(uvxy_pct), sub_color=pct_color(uvxy_pct))
+metric_card(c4, "UVXY 漲跌幅",   fmt_pct(uvxy_pct), pct_color(uvxy_pct))
+metric_card(c5, "皮爾森係數",    f"{corr_value:.3f}" if corr_value is not None else "—", corr_color)
+metric_card(c6, "相關性狀態",    status_text if corr_value is not None else "計算中",
+            "#e84045" if direction_diverge else "#00d97e")
+metric_card(c7, "最後更新",      datetime.now().strftime("%H:%M:%S"), "#8b8fa8")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
