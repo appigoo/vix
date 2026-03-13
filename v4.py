@@ -106,8 +106,8 @@ def make_corr_chart(history: pd.DataFrame) -> go.Figure:
     return fig
 
 # ── Session state init ────────────────────────────────────────────────────────
-if "corr_history" not in st.session_state:
-    st.session_state.corr_history = pd.DataFrame(columns=["time", "corr"])
+if "corr_history" not in st.session_state or not isinstance(st.session_state.corr_history, pd.DataFrame):
+    st.session_state.corr_history = pd.DataFrame({"time": pd.Series(dtype="datetime64[ns]"), "corr": pd.Series(dtype="float64")})
 if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = None
 if "alert_log" not in st.session_state:
@@ -160,10 +160,13 @@ if data_ok:
 
         # Append to history (keep last 120 points)
         now = datetime.now()
-        new_row = pd.DataFrame([{"time": now, "corr": corr_value}])
+        new_row = pd.DataFrame({"time": [pd.Timestamp(now)], "corr": [float(corr_value)]})
+        existing = st.session_state.corr_history
+        if not isinstance(existing, pd.DataFrame):
+            existing = pd.DataFrame({"time": pd.Series(dtype="datetime64[ns]"), "corr": pd.Series(dtype="float64")})
         st.session_state.corr_history = pd.concat(
-            [st.session_state.corr_history, new_row], ignore_index=True
-        ).tail(120)
+            [existing, new_row], ignore_index=True
+        ).tail(120).reset_index(drop=True)
 
         # Direction check over detect_window
         tsla_recent = tsla_aligned.iloc[-detect_window:]
