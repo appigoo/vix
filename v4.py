@@ -152,47 +152,87 @@ def fetch_yfinance(ticker: str, bars: int = 30, prepost: bool = False) -> pd.Dat
 def fetch_yahoo_chart_api(ticker: str, bars: int = 30) -> pd.DataFrame:
     """
     Fetch 1-min OHLCV directly from Yahoo Finance v8 chart API.
-    This endpoint returns real-time data including pre/post-market
-    for indices like ^VIX — same source TradingView Yahoo feed uses.
+    Tries both v8 and v8/finance/chart endpoints with cookie-based auth.
     No API key required.
     """
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-            f"?interval=1m&range=1d&includePrePost=true"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return pd.DataFrame()
+    # Try multiple Yahoo endpoints
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&includePrePost=true",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finance.yahoo.com/",
+    }
 
-        data = r.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return pd.DataFrame()
+    last_err = ""
+    for url in urls:
+        try:
+            # First get a crumb/cookie from Yahoo
+            session = requests.Session()
+            session.headers.update(headers)
+            # Get cookie
+            session.get("https://finance.yahoo.com", timeout=5)
+            r = session.get(url, timeout=10)
 
-        res      = result[0]
-        ts       = res.get("timestamp", [])
-        quote    = res["indicators"]["quote"][0]
-        adjclose = res["indicators"].get("adjclose", [{}])[0].get("adjclose", quote.get("close"))
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} for {ticker}"
+                continue
 
-        df = pd.DataFrame({
-            "Open":   quote.get("open",   []),
-            "High":   quote.get("high",   []),
-            "Low":    quote.get("low",    []),
-            "Close":  adjclose if adjclose else quote.get("close", []),
-            "Volume": quote.get("volume", []),
-        }, index=pd.to_datetime(ts, unit="s", utc=True))
+            data   = r.json()
+            result = data.get("chart", {}).get("result") or []
+            error  = data.get("chart", {}).get("error")
 
-        df = df.dropna(subset=["Open", "Close"])
-        df.index = df.index.tz_convert("America/New_York")
-        return df.tail(bars)
-    except Exception:
-        return pd.DataFrame()
+            if error:
+                last_err = f"Yahoo error: {error}"
+                continue
+            if not result:
+                last_err = f"Empty result for {ticker}"
+                continue
+
+            res   = result[0]
+            ts    = res.get("timestamp", [])
+            if not ts:
+                last_err = f"No timestamps for {ticker}"
+                continue
+
+            quote    = res["indicators"]["quote"][0]
+            adjclose_list = (res["indicators"].get("adjclose") or [{}])
+            adjclose = adjclose_list[0].get("adjclose") if adjclose_list else None
+
+            close_data = adjclose if adjclose else quote.get("close", [])
+
+            df = pd.DataFrame({
+                "Open":   quote.get("open",   [None]*len(ts)),
+                "High":   quote.get("high",   [None]*len(ts)),
+                "Low":    quote.get("low",    [None]*len(ts)),
+                "Close":  close_data if close_data else [None]*len(ts),
+                "Volume": quote.get("volume", [0]*len(ts)),
+            }, index=pd.to_datetime(ts, unit="s", utc=True))
+
+            df = df.dropna(subset=["Open", "Close"])
+            if df.empty:
+                last_err = f"All NaN after dropna for {ticker}"
+                continue
+
+            df.index = df.index.tz_convert("America/New_York")
+            # Store success info
+            st.session_state[f"yahoo_api_{ticker}_ok"] = (
+                f"✅ {ticker}: {len(df)} bars, latest {df.index[-1].strftime('%H:%M')}"
+            )
+            return df.tail(bars)
+
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+    # All attempts failed — store error for sidebar display
+    st.session_state[f"yahoo_api_{ticker}_ok"] = f"❌ {ticker}: {last_err}"
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=55)
@@ -346,7 +386,12 @@ def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
         tsla = fetch_yfinance("TSLA", 30, prepost=is_pre)
 
     # ── VIX ───────────────────────────────────────────
-    vix = fetch_yahoo_chart_api("%5EVIX", 30)   # %5E = ^ URL-encoded
+    # Try multiple ticker formats for Yahoo Chart API
+    vix = fetch_yahoo_chart_api("%5EVIX", 30)
+    if vix.empty:
+        vix = fetch_yahoo_chart_api("^VIX", 30)
+    if vix.empty:
+        vix = fetch_yahoo_chart_api("VIX", 30)
     if vix.empty:
         vix = fetch_yfinance("^VIX", 30, prepost=is_pre)
     # Last resort in pre-market: Alpaca UVXY
@@ -600,6 +645,17 @@ api_secret = "XXXXXXXXXXXXXXXXXXXXXXXX"
                 else:
                     st.error("❌ 連線失敗")
                 st.code(msg, language="text")
+
+    st.divider()
+    st.markdown("### 📡 數據源狀態")
+    for key in ["yahoo_api_TSLA_ok", "yahoo_api_%5EVIX_ok", "yahoo_api_^VIX_ok", "yahoo_api_VIX_ok"]:
+        val = st.session_state.get(key)
+        if val:
+            color = "#00d084" if val.startswith("✅") else "#ff4d6d"
+            st.markdown(
+                f'<div style="font-size:11px;color:{color};padding:2px 0">{val}</div>',
+                unsafe_allow_html=True,
+            )
 
     st.divider()
     if st.button("🗑️ 清除歷史"):
