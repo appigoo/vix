@@ -188,50 +188,71 @@ def fetch_alpaca(ticker: str, bars: int = 30) -> pd.DataFrame:
 
 def test_alpaca_connection() -> tuple[bool, str]:
     """Diagnostic call — returns (success, message)."""
+    lines_out = []
+
+    # Step 1: read + validate secrets
     try:
         key    = st.secrets["alpaca"]["api_key"]
         secret = st.secrets["alpaca"]["api_secret"]
-    except Exception:
-        return False, "❌ secrets.toml 中找不到 [alpaca] 設定"
+    except Exception as e:
+        return False, f"❌ secrets.toml 讀取失敗：{e}"
+
+    key    = str(key).strip()    if key    is not None else ""
+    secret = str(secret).strip() if secret is not None else ""
+
+    lines_out.append(f"📋 api_key    長度：{len(key)} 字元  前綴：{key[:6] if len(key)>=6 else key}...")
+    lines_out.append(f"📋 api_secret 長度：{len(secret)} 字元  前綴：{secret[:4] if len(secret)>=4 else '(空)'}...")
+
+    if not key:
+        lines_out.append("❌ api_key 是空值！請檢查 secrets.toml")
+        return False, "\n".join(lines_out)
+    if not secret:
+        lines_out.append("❌ api_secret 是空值！")
+        lines_out.append("請在 Alpaca 後台點 Regenerate，重新複製 Secret 填入 secrets.toml")
+        return False, "\n".join(lines_out)
+
+    lines_out.append("")
     try:
         headers = {
             "APCA-API-KEY-ID":     key,
             "APCA-API-SECRET-KEY": secret,
         }
-        # 1) Auth check via account endpoint
+        # Step 2: Auth check
         acct = requests.get(
             "https://paper-api.alpaca.markets/v2/account",
             headers=headers, timeout=10,
         )
-        # 2) Data check
+        lines_out.append(f"🔑 Auth 端點：HTTP {acct.status_code}")
+        if acct.status_code == 200:
+            info = acct.json()
+            lines_out.append(f"   帳戶狀態：{info.get('status','?')}  類型：{info.get('account_type','paper')}")
+        else:
+            lines_out.append(f"   回應：{acct.text[:300]}")
+
+        # Step 3: Data check
         data_r = requests.get(
             "https://data.alpaca.markets/v2/stocks/TSLA/bars"
             "?timeframe=1Min&limit=3&feed=iex&adjustment=raw",
             headers=headers, timeout=10,
         )
-        lines = []
-        lines.append(f"🔑 Auth 端點：HTTP {acct.status_code}")
-        if acct.status_code == 200:
-            info = acct.json()
-            lines.append(f"   帳戶狀態：{info.get('status','?')}  "
-                         f"類型：{info.get('account_type','?')}")
-        else:
-            lines.append(f"   錯誤：{acct.text[:200]}")
-
-        lines.append(f"📊 Data 端點：HTTP {data_r.status_code}")
+        lines_out.append(f"📊 Data 端點：HTTP {data_r.status_code}")
         if data_r.status_code == 200:
-            bars = data_r.json().get("bars", [])
-            lines.append(f"   取得 TSLA bars：{len(bars)} 根")
+            bars = data_r.json().get("bars") or []
+            lines_out.append(f"   取得 TSLA bars：{len(bars)} 根")
             if bars:
-                lines.append(f"   最新一根時間：{bars[-1].get('t','?')}")
-                lines.append(f"   收盤價：{bars[-1].get('c','?')}")
+                lines_out.append(f"   最新時間：{bars[-1].get('t','?')}")
+                lines_out.append(f"   收盤價：${bars[-1].get('c','?')}")
+            else:
+                lines_out.append("   ⚠️ bars 為空（市場休市或盤前無數據）")
         else:
-            lines.append(f"   錯誤：{data_r.text[:200]}")
+            lines_out.append(f"   回應：{data_r.text[:300]}")
 
         success = data_r.status_code == 200
-        return success, "\n".join(lines)
+        return success, "\n".join(lines_out)
     except Exception as e:
-        return False, f"❌ 網絡錯誤：{type(e).__name__}: {e}"
+        lines_out.append(f"❌ 網絡/請求錯誤：{type(e).__name__}: {e}")
+        return False, "\n".join(lines_out)
+
 
 
 def fetch_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
